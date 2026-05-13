@@ -156,12 +156,11 @@ pub async fn handle_nfs(
         NFSProgram::NFSPROC3_READLINK => nfsproc3_readlink(xid, input, output, context).await?,
         NFSProgram::NFSPROC3_MKNOD => nfsproc3_mknod(xid, input, output, context).await?,
         NFSProgram::NFSPROC3_LINK => nfsproc3_link(xid, input, output, context).await?,
+        NFSProgram::NFSPROC3_COMMIT => nfsproc3_commit(xid, input, output, context).await?,
         _ => {
             warn!("Unimplemented message {:?}", prog);
             proc_unavail_reply_message(xid).serialize(output)?;
-        } /*
-          NFSPROC3_COMMIT,
-          INVALID*/
+        } /* INVALID */
     }
     Ok(())
 }
@@ -1313,8 +1312,17 @@ pub async fn nfsproc3_write(
         }
     };
 
-    // Check write permission
-    if !permissions::can_write(&context.auth, &attr) {
+    // Allow the file owner to write regardless of file mode. NFSv3 is
+    // stateless so the server cannot track open file descriptors — when a
+    // client creates a file with mode 0444 (e.g. git loose objects), writes
+    // data, and the NFS client flushes dirty pages on close(), the deferred
+    // WRITE would be rejected because the file is now read-only. Granting
+    // the owner implicit write access mirrors the POSIX convention that the
+    // owner can always chmod and re-open, and keeps non-owner permission
+    // enforcement intact.
+    if !permissions::is_owner(&context.auth, &attr)
+        && !permissions::can_write(&context.auth, &attr)
+    {
         debug!("write permission denied for uid={}", context.auth.uid);
         let pre_obj_attr = nfs::pre_op_attr::attributes(nfs::wcc_attr {
             size: attr.size,
@@ -1366,6 +1374,79 @@ pub async fn nfsproc3_write(
         }
         Err(stat) => {
             error!("write error {:?} --> {:?}", xid, stat);
+            make_success_reply(xid).serialize(output)?;
+            stat.serialize(output)?;
+            nfs::wcc_data::default().serialize(output)?;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// COMMIT (procedure 21)
+//
+// Since WRITE already uses FILE_SYNC (data is committed to stable storage
+// on every write), COMMIT is effectively a no-op. We just return success
+// with the current file attributes and the server write verifier.
+// ---------------------------------------------------------------------------
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Default)]
+struct COMMIT3args {
+    file: nfs::nfs_fh3,
+    offset: nfs::offset3,
+    count: nfs::count3,
+}
+XDRStruct!(COMMIT3args, file, offset, count);
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Default)]
+struct COMMIT3resok {
+    file_wcc: nfs::wcc_data,
+    verf: nfs::writeverf3,
+}
+XDRStruct!(COMMIT3resok, file_wcc, verf);
+
+pub async fn nfsproc3_commit(
+    xid: u32,
+    input: &mut impl Read,
+    output: &mut impl Write,
+    context: &RPCContext,
+) -> Result<(), anyhow::Error> {
+    let mut args = COMMIT3args::default();
+    args.deserialize(input)?;
+    debug!("nfsproc3_commit({:?},{:?}) ", xid, args.file);
+
+    let id = context.vfs.fh_to_id(&args.file);
+    if let Err(stat) = id {
+        make_success_reply(xid).serialize(output)?;
+        stat.serialize(output)?;
+        nfs::wcc_data::default().serialize(output)?;
+        return Ok(());
+    }
+    let id = id.unwrap();
+
+    // Get current file attributes for wcc_data.
+    // COMMIT is a no-op since we use FILE_SYNC on all writes.
+    match context.vfs.getattr(id).await {
+        Ok(attr) => {
+            let wcc = nfs::wcc_data {
+                before: nfs::pre_op_attr::attributes(nfs::wcc_attr {
+                    size: attr.size,
+                    mtime: attr.mtime,
+                    ctime: attr.ctime,
+                }),
+                after: nfs::post_op_attr::attributes(attr),
+            };
+            let res = COMMIT3resok {
+                file_wcc: wcc,
+                verf: context.vfs.serverid(),
+            };
+            make_success_reply(xid).serialize(output)?;
+            nfs::nfsstat3::NFS3_OK.serialize(output)?;
+            res.serialize(output)?;
+        }
+        Err(stat) => {
             make_success_reply(xid).serialize(output)?;
             stat.serialize(output)?;
             nfs::wcc_data::default().serialize(output)?;
